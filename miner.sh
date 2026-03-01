@@ -172,14 +172,12 @@ fi
         if (( stable_counter >= 8 )) && (( last_threads > 2 )); then
             echo "🌡️ Ajustement thermique stable : $last_threads -> $current_threads"
             last_threads="$current_threads"
-            kill "$xmrig_pid" 2>/dev/null || true
-            break
         fi
 
         delay=$(adaptive_loop_delay)
 
 # Sécurité anti-agressivité
-(( delay < 15 )) && delay=15
+(( delay < 8 )) && delay=8
 
 sleep "$delay"
     done

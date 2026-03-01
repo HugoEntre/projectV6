@@ -14,3 +14,4 @@
 
 # Build directory
 masterV6_project/xmrig_build/
+.env_m6

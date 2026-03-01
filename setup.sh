@@ -21,7 +21,7 @@ pkg update -y >/dev/null 2>&1 || true
 
 #--- OUTILS DE BASE ---
 
-pkg install -y curl coreutils rsync procps --silent
+pkg install -y curl coreutils rsync procps >/dev/null 2>&1 || true
 
 echo "📂 Normalisation projet..."
 # reset state seulement si flag explicite
@@ -37,8 +37,8 @@ cd "$TARGET_DIR"
 #--- DEPENDANCES ---
 
 echo "🔐 Installation dépendances..."
-pkg upgrade -y -o Dpkg::Options::="--force-confold"
-pkg install -y dos2unix jq util-linux termux-api git coreutils sed grep gawk inotify-tools --silent
+pkg upgrade -y >/dev/null 2>&1 || true
+pkg install -y dos2unix jq util-linux termux-api git coreutils sed grep gawk inotify-tools >/dev/null 2>&1 || true
 
 #--- INOTIFY FLAG ---
 
@@ -55,12 +55,16 @@ chmod +x *.sh 2>/dev/null || true
 
 #--- XMRIG ---
 
+[[ -f "$TARGET_DIR/install_xmrig.sh" ]] || { echo "❌ install_xmrig absent"; exit 1; }
+
 echo "🛠️ Vérification XMRig..."
-if [ -x "$TARGET_DIR/xmrig_build/xmrig" ] || [ -x "$HOME/xmrig/build/xmrig" ]; then
-echo "✅ XMRig OK"
+
+if [ -x "$TARGET_DIR/xmrig_build/xmrig" ] \
+|| [ -x "$HOME/xmrig/build/xmrig" ]; then
+    echo "✅ XMRig OK"
 else
-[ -f "./functions.sh" ] && source ./functions.sh || true
-bash "$TARGET_DIR/install_xmrig.sh" || { echo "❌ Erreur install_xmrig"; exit 1; }
+    [ -f "./functions.sh" ] && source ./functions.sh || true
+    bash "$TARGET_DIR/install_xmrig.sh" || { echo "❌ Erreur install_xmrig"; exit 1; }
 fi
 
 #--- WALLET ---
@@ -69,6 +73,7 @@ WALLET_FILE="$HOME/.masterV6_wallet"
 if [ ! -f "$WALLET_FILE" ]; then
 echo "💎 Configuration Wallet VET"
 [ -f "./functions.sh" ] && source ./functions.sh
+
 while true; do
 read -r -p "Adresse (0x...) : " RAW
 CLEAN="$(printf '%s' "$RAW" | tr -d '[:space:]' | sed 's/^VET://I')"
@@ -78,11 +83,18 @@ done
 chmod 600 "$WALLET_FILE"
 fi
 
-#--- COMMANDE GLOBALE M6 ---
-
 echo "⚙️ Configuration système..."
-sed -i '/# AUTO_MASTER_V6/d' ~/.bashrc
-echo "alias m6='cd $TARGET_DIR && ./start.sh' # AUTO_MASTER_V6" >> ~/.bashrc
+
+# Safe bashrc pour Termux neuf
+[ -f "$HOME/.bashrc" ] || touch "$HOME/.bashrc"
+
+sed -i '/# AUTO_MASTER_V6/d' "$HOME/.bashrc"
+echo "alias m6='cd ~/masterV6_project && ./start.sh' # AUTO_MASTER_V6" >> "$HOME/.bashrc"
+
+# recharge alias immédiatement
+
+[ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null || true
+hash -r
 
 printf "#!$PREFIX/bin/bash\ncd $TARGET_DIR && exec ./start.sh\n" > "$PREFIX/bin/m6"
 chmod +x "$PREFIX/bin/m6"
@@ -91,7 +103,7 @@ chmod +x "$PREFIX/bin/m6"
 
 echo "🧹 Nettoyage..."
 pkill -f "xmrig" 2>/dev/null || true
-rm -f "$HOME/.masterV6.global.lock" "$TARGET_DIR/.masterV6.lock" 2>/dev/null || true
+rm -f "$TARGET_DIR/.masterV6.lock" 2>/dev/null || true
 
 echo "------------------------------------"
 echo "✅ MASTER V6 INSTALLATION TERMINÉE"

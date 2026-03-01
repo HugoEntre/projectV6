@@ -30,6 +30,43 @@ detect_charge_control() {
     return 1
 }
 
+control_charge() {
+
+    [[ -z "$M6_CHARGE_NODE" ]] && return 0
+    [[ ! -w "$M6_CHARGE_NODE" ]] && return 0
+
+    local level="$1"
+
+    # Seuils industriels
+    local STOP=85
+    local START=65
+
+    local current_state
+    current_state=$(cat "$M6_CHARGE_NODE" 2>/dev/null)
+
+    # --- STOP CHARGE ---
+    if (( level >= STOP )); then
+        if [[ "$M6_CHARGE_REVERSE" == "true" ]]; then
+            echo 1 > "$M6_CHARGE_NODE"
+        else
+            echo 0 > "$M6_CHARGE_NODE"
+        fi
+        state_set CHARGE_CTRL "OFF"
+        return
+    fi
+
+    # --- START CHARGE ---
+    if (( level <= START )); then
+        if [[ "$M6_CHARGE_REVERSE" == "true" ]]; then
+            echo 0 > "$M6_CHARGE_NODE"
+        else
+            echo 1 > "$M6_CHARGE_NODE"
+        fi
+        state_set CHARGE_CTRL "ON"
+        return
+    fi
+}
+
 export M6_CHARGE_NODE=$(detect_charge_control)
 
 # Déterminer si la logique est inversée (ex: input_suspend: 1=Stop)
@@ -88,39 +125,136 @@ get_phone_model() {
 }
 
 # ==================================================
+# CPU TOPOLOGY (DETECTION UNIQUE)
+# ==================================================
+
+CPU_LITTLE=""
+CPU_BIG=""
+CPU_TOPOLOGY_READY=0
+
+detect_cpu_topology() {
+
+    [[ "$CPU_TOPOLOGY_READY" == "1" ]] && return
+
+    local idx cap
+
+    for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+
+        idx=$(basename "$cpu" | tr -dc '0-9')
+        [[ -f "$cpu/cpu_capacity" ]] || continue
+
+        read -r cap < "$cpu/cpu_capacity" 2>/dev/null || continue
+        [[ "$cap" =~ ^[0-9]+$ ]] || continue
+
+        if (( cap < 600 )); then
+            CPU_LITTLE+="${idx},"
+        else
+            CPU_BIG+="${idx},"
+        fi
+    done
+
+    CPU_LITTLE="${CPU_LITTLE%,}"
+    CPU_BIG="${CPU_BIG%,}"
+
+    CPU_TOPOLOGY_READY=1
+}
+
+# ==================================================
 # DEVICE METRICS (ANDROID SAFE)
 # ==================================================
 
-get_temp() {
-    local t
-    for Z in /sys/class/thermal/thermal_zone*/temp; do
-        read -r t < "$Z" 2>/dev/null || continue
-        [[ "$t" =~ ^[0-9]+$ ]] && echo $(( t>1000 ? t/1000 : t )) && return
+get_cpu_temp() {
+    # Initialisation des variables
+    local temp_value=0
+    local max_temp=0
+    local type_name=""
+    local temp_raw=""
+    
+    # Vérification de l'existence du répertoire thermal
+    if [ ! -d "/sys/class/thermal" ]; then
+        echo "0"
+        return 1
+    fi
+    
+    # Parcours des zones thermiques
+    for zone in /sys/class/thermal/thermal_zone[0-9]*; do
+        # Vérification que le chemin existe et est accessible
+        [ -e "$zone" ] || continue
+        
+        # Lecture sécurisée du type avec timeout et vérification
+        if [ -r "$zone/type" ] && [ -f "$zone/type" ]; then
+            type_name=$(cat "$zone/type" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '\0')
+        else
+            continue
+        fi
+        
+        # Filtrage intelligent des zones CPU
+        case "$type_name" in
+    *cpu*|*cluster*|*tsens*|*apc*|*soc*|*core*|*cpuss*|*cpux*|\
+    big|little|ap|g3d)
+                # Exclusion des types non-CPU
+                case "$type_name" in
+                    *battery*|*charger*|*pmic*|*ambient*|*skin*|*quiet*|*step*|*lowf*|\
+                    *ddr*|*wlan*|*wifi*|*battery*|*charger*|*bcl*|*xo*|*pmi*|*vf*|*camera*)
+                        continue
+                        ;;
+                esac
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        
+        # Lecture sécurisée de la température
+        if [ -r "$zone/temp" ] && [ -f "$zone/temp" ]; then
+            temp_raw=$(cat "$zone/temp" 2>/dev/null | tr -d '\0')
+        else
+            continue
+        fi
+        
+        # Validation stricte de la valeur
+        case "$temp_raw" in
+            ''|*[!0-9-]*)
+                continue
+                ;;
+        esac
+        
+        # Conversion en nombre
+        temp_value=$((temp_raw + 0))
+        
+        # Normalisation de l'unité (millidegrés → degrés)
+        if [ "$temp_value" -gt 1000000 ]; then
+    temp_value=$((temp_value / 1000000))
+elif [ "$temp_value" -gt 1000 ]; then
+    temp_value=$((temp_value / 1000))
+fi
+        
+        # Validation des plages de température réalistes (-40°C à 150°C)
+        if [ "$temp_value" -lt -40 ] || [ "$temp_value" -gt 150 ]; then
+            continue
+        fi
+        
+        # Mise à jour du maximum
+        if [ "$temp_value" -gt "$max_temp" ]; then
+            # Vérification supplémentaire : ignorer les valeurs anormalement hautes
+            if [ "$temp_value" -lt 120 ]; then
+                max_temp=$temp_value
+            fi
+        fi
     done
-    echo 35
+    
+    # Retourner la température ou 0 si aucune trouvée
+    echo "$max_temp"
+    
+    # Code de retour : 0 si température trouvée, 1 sinon
+    [ "$max_temp" -gt 0 ] && return 0 || return 1
 }
 
-get_cpu_temp() {
-    local t type best=0
-
-    for Z in /sys/class/thermal/thermal_zone*; do
-        read -r type < "$Z/type" 2>/dev/null || continue
-
-        case "$type" in
-            *cpu*|*soc*|*cluster*|*gold*|*silver*|*big*|*little*|*tsens*)
-                read -r t < "$Z/temp" 2>/dev/null || continue
-                [[ "$t" =~ ^[0-9]+$ ]] || continue
-                (( t>1000 )) && t=$((t/1000))
-                (( t > best )) && best=$t
-            ;;
-        esac
-    done
-
-    if (( best > 0 )); then
-        echo "$best"
-    else
-        get_temp
-    fi
+get_cached_cpu_temp() {
+    local t
+    t=$(state_get CPU_TEMP)
+    [[ -z "$t" ]] && t=$(get_cpu_temp)
+    echo "$t"
 }
 
 get_battery_temp() {
@@ -143,32 +277,39 @@ get_battery_temp() {
         [[ -f "$B/temp" ]] || continue
         read -r t < "$B/temp" 2>/dev/null || continue
         [[ "$t" =~ ^[0-9]+$ ]] || continue
-        (( t>1000 )) && t=$((t/10))
-        echo "$t"
-        return
+
+        # Correction universelle unités
+        if (( t > 20000 )); then
+            t=$((t/1000))   # millidegrés
+        elif (( t > 1000 )); then
+            t=$((t/10))     # décicelsius
+        fi
+
+        # plage réaliste batterie
+        (( t >= 15 && t <= 60 )) && { echo "$t"; return; }
     done
 
-    # --- FALLBACK SAFE ---
-    echo 30
+    echo 0
+}
+
+get_cached_battery_level() {
+    local b
+    b=$(state_get BAT_LVL)
+    [[ -z "$b" ]] && b=$(get_battery)
+    echo "$b"
 }
 
 update_thermal_cache() {
-
     local now last cpu bat
     now=$(date +%s)
     last=$(state_get THERM_LAST)
     : "${last:=0}"
-
     (( now - last < 8 )) && return 0
-
     state_set THERM_LAST "$now"
-
     cpu=$(get_cpu_temp)
-    bat=$(get_battery_temp)
-
+    bat=$(get_battery_temp 2>/dev/null || echo "")
     [[ "$cpu" =~ ^[0-9.]+$ ]] || cpu=0
     [[ "$bat" =~ ^[0-9.]+$ ]] || bat=0
-
     state_set CPU_TEMP "$cpu"
     state_set BAT_TEMP "$bat"
 }
@@ -222,6 +363,7 @@ fi
 # Sauvegarde état pour le bot
 state_set BAT_MODE "$mode"
 state_set BAT_LVL "$bat"
+state_set BAT_STATUS "$status"
 
 # --- CACHE BATTERIE ---
 state_set LAST_BAT_VALUE "$bat"
@@ -262,14 +404,6 @@ get_threads() {
 # HASHRATE / LOG SAFE
 # ==================================================
 
-update_state_from_log() {
-    [[ -f "$LOGFILE" ]] || return 0
-    local hs
-    hs=$(tail -n40 "$LOGFILE" 2>/dev/null | awk '/speed/{print $2}' | tail -n1)
-    [[ "$hs" =~ ^[0-9.]+$ ]] || hs="0.00"
-    state_set HS "$hs"
-}
-
 get_hashrate() {
     local h
     h=$(grep -a "speed 10s/60s/15m" "$LOGFILE" 2>/dev/null | tail -1 | awk '{print $6}')
@@ -292,86 +426,39 @@ is_miner_running() {
 
 check_system_health() {
     local temp bat
-    temp=$(state_get CPU_TEMP)
-[[ -z "$temp" ]] && temp=$(get_cpu_temp)
-
-bat=$(state_get BAT_LVL)
-[[ -z "$bat" ]] && bat=$(get_battery)
-    (( temp>=${MAX_TEMP:-75} )) && return 1
+    temp=$(get_cached_cpu_temp)
+    bat=$(get_cached_battery_level)
+    (( temp>=${MAX_TEMP:-80} )) && return 1
     (( bat<${BATTERY_MIN:-15} )) && return 1
     return 0
 }
 
 get_dynamic_cpu_mask() {
-
+    detect_cpu_topology
     local temp
-    temp=$(state_get CPU_TEMP)
-[[ -z "$temp" ]] && temp=$(get_cpu_temp)
+    temp=$(get_cached_cpu_temp)
 
-    local LITTLE=""
-    local BIG=""
-    local idx cap
-
-    for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
-
-        idx=$(basename "$cpu" | tr -dc '0-9')
-
-        if [[ -f "$cpu/cpu_capacity" ]]; then
-            read -r cap < "$cpu/cpu_capacity"
-        else
-            continue
-        fi
-
-        # seuil empirique Android
-        if (( cap < 600 )); then
-            LITTLE="${LITTLE}${idx},"
-        else
-            BIG="${BIG}${idx},"
-        fi
-    done
-
-    LITTLE="${LITTLE%,}"
-    BIG="${BIG%,}"
-
-    # 🔥 Mode froid → LITTLE + 1 BIG
-    if (( temp < 60 )) && [[ -n "$BIG" ]]; then
-        echo "${LITTLE},${BIG%%,*}"
+    # Mode froid → LITTLE + 1 BIG
+    if (( temp < 60 )) && [[ -n "$CPU_BIG" ]]; then
+        echo "${CPU_LITTLE},${CPU_BIG%%,*}"
         return
     fi
 
-    # 🌡️ Mode moyen → LITTLE only
+    # Température moyenne
     if (( temp >= 58 && temp < 66 )); then
-        echo "$LITTLE"
+        echo "$CPU_LITTLE"
         return
     fi
 
-    # 🔥 Chaud → LITTLE réduit
-    echo "${LITTLE%%,*}"
+    # Chaud
+    echo "${CPU_LITTLE%%,*}"
 }
 
 pin_xmrig_threads() {
-
+    detect_cpu_topology
+    [[ -z "$CPU_BIG" ]] && return
     local pid="$1"
     [[ -z "$pid" ]] && return
-
-    local LITTLE BIG idx cap
-    LITTLE=""
-    BIG=""
-
-    for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
-        idx=$(basename "$cpu" | tr -dc '0-9')
-        [[ -f "$cpu/cpu_capacity" ]] || continue
-        read -r cap < "$cpu/cpu_capacity"
-
-        if (( cap < 600 )); then
-            LITTLE+="${idx},"
-        else
-            BIG+="${idx},"
-        fi
-    done
-
-    LITTLE="${LITTLE%,}"
-    BIG="${BIG%,}"
 
     # récupération TID xmrig
     local tids
@@ -379,14 +466,11 @@ pin_xmrig_threads() {
 
     local i=0
     for tid in $tids; do
-
-        # premiers threads → BIG
-        if (( i < 2 )) && [[ -n "$BIG" ]]; then
-            taskset -pc "$BIG" "$tid" >/dev/null 2>&1
-        else
-            taskset -pc "$LITTLE" "$tid" >/dev/null 2>&1
-        fi
-
+if (( i < 2 )) && [[ -n "$CPU_BIG" ]]; then
+    taskset -pc "$CPU_BIG" "$tid" >/dev/null 2>&1
+else
+    taskset -pc "$CPU_LITTLE" "$tid" >/dev/null 2>&1
+fi
         ((i++))
     done
 }
@@ -439,6 +523,9 @@ measure_thread_load() {
 }
 
 pin_xmrig_threads_smart() {
+    detect_cpu_topology
+    local tmpfile sortedfile
+    [[ -z "$CPU_BIG" ]] && return
     local pid="$1"
     [[ -z "$pid" ]] && return
     
@@ -446,29 +533,7 @@ pin_xmrig_threads_smart() {
     if ! kill -0 "$pid" 2>/dev/null; then
         return
     fi
-    
-    local LITTLE="" BIG="" idx cap
-    local tmpfile sortedfile
-    
-    # Détection des cœurs LITTLE/BIG
-    for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
-        idx=$(basename "$cpu" | tr -dc '0-9')
-        [[ -f "$cpu/cpu_capacity" ]] || continue
-        read -r cap < "$cpu/cpu_capacity" 2>/dev/null || continue
-        
-        if [[ "$cap" =~ ^[0-9]+$ ]] && (( cap < 600 )); then
-            LITTLE+="${idx},"
-        elif [[ "$cap" =~ ^[0-9]+$ ]]; then
-            BIG+="${idx},"
-        fi
-    done
-    
-    LITTLE="${LITTLE%,}"
-    BIG="${BIG%,}"
-    
-    # Si pas de BIG cores, sortir
-    [[ -z "$BIG" ]] && return
-    
+    [[ -z "$CPU_BIG" ]] && return
     local TMPDIR="${TMPDIR:-$PREFIX/tmp}"
     mkdir -p "$TMPDIR" 2>/dev/null || true
     
@@ -506,9 +571,9 @@ pin_xmrig_threads_smart() {
         if [[ -d "/proc/$pid/task/$tid" ]]; then
             # Les 2 threads les plus chargés sur BIG cores
             if (( i < 2 )); then
-                taskset -pc "$BIG" "$tid" >/dev/null 2>&1
+                taskset -pc "$CPU_BIG" "$tid" >/dev/null 2>&1
             else
-                taskset -pc "$LITTLE" "$tid" >/dev/null 2>&1
+                taskset -pc "$CPU_LITTLE" "$tid" >/dev/null 2>&1
             fi
         fi
         ((i++))
@@ -519,29 +584,11 @@ pin_xmrig_threads_smart() {
 }
 
 thread_migration_guard() {
-
+    
+    detect_cpu_topology
+    [[ -z "$CPU_BIG" ]] && return
     local pid="$1"
     [[ -z "$pid" ]] && return
-
-    local LITTLE="" BIG="" idx cap
-
-    # --- topology réelle ---
-    for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
-        idx=$(basename "$cpu" | tr -dc '0-9')
-        [[ -f "$cpu/cpu_capacity" ]] || continue
-        read -r cap < "$cpu/cpu_capacity"
-
-        if (( cap < 600 )); then
-            LITTLE+="${idx},"
-        else
-            BIG+="${idx},"
-        fi
-    done
-
-    LITTLE="${LITTLE%,}"
-    BIG="${BIG%,}"
-
-    [[ -z "$BIG" ]] && return
 
     local tid cpu
 
@@ -553,10 +600,10 @@ thread_migration_guard() {
         cpu=$(awk '{print $39}' "/proc/$pid/task/$tid/stat")
 
         # si thread censé être BIG mais tourne ailleurs
-        if taskset -pc "$tid" 2>/dev/null | grep -q "$BIG"; then
+        if taskset -pc "$tid" 2>/dev/null | grep -q "$CPU_BIG"; then
 
-            if ! echo "$cpu" | grep -qw "$BIG"; then
-                taskset -pc "$BIG" "$tid" >/dev/null 2>&1
+            if ! echo "$cpu" | grep -qw "$CPU_BIG"; then
+                taskset -pc "$CPU_BIG" "$tid" >/dev/null 2>&1
             fi
         fi
 
@@ -579,70 +626,45 @@ send_notif() {
 
 compute_optimal_threads() {
 
-    local temp bat total learned best base
-
-    temp=$(state_get CPU_TEMP)
-    [[ -z "$temp" ]] && temp=$(get_cpu_temp)
-
-    bat=$(state_get BAT_LVL)
-    [[ -z "$bat" ]] && bat=$(get_battery)
-
+    local total temp battemp
     total=$(nproc 2>/dev/null || echo 4)
-    (( total > 12 )) && total=12
+    (( total > 32 )) && total=32
 
-    # 🔥 Sécurité thermique prioritaire
-    if (( temp >= 72 )); then
+    temp=$(get_cached_cpu_temp)
+    battemp=$(state_get BAT_TEMP)
+
+    # Protection SoC
+    if (( temp >= MAX_TEMP+2 )); then
         echo 1
         return
     fi
 
-    if (( temp >= 66 )); then
-        echo $(( total/3 > 1 ? total/3 : 1 ))
+    # Protection batterie
+    if [[ "$battemp" =~ ^[0-9.]+$ ]] && (( ${battemp%.*} >= BATTERY_HOT )); then
+        echo $(( total*60/100 ))
         return
     fi
 
-    # 🔋 Batterie faible non branchée
-    if (( bat <= 22 )); then
-        echo $(( total/2 > 1 ? total/2 : 1 ))
-        return
-    fi
-
-    # 🚀 Sinon on regarde la power curve
-    best=$(power_curve_best_threads)
-    [[ -n "$best" && "$best" -gt 0 ]] && {
-        echo "$best"
-        return
-    }
-
-    # défaut stable
-    echo $(( total*60/100 ))
+    # Zone optimale accepted
+    echo $(( total*75/100 ))
 }
 
 thermal_pause_needed() {
-
-    local temp bat charging
-
-    temp=$(state_get CPU_TEMP)
-[[ -z "$temp" ]] && temp=$(get_cpu_temp)
-    bat=$(state_get LAST_BAT_VALUE)
-[[ -z "$bat" ]] && bat=$(get_battery)
+    local temp bat charging status
+    temp=$(get_cached_cpu_temp)
+    bat=$(get_cached_battery_level)
 
     # Détection état charge Android universel
-    charging=0
-    for path in /sys/class/power_supply/*; do
-        if [[ -f "$path/status" ]]; then
-            read -r st < "$path/status"
-            case "$st" in
-                Charging|Full) charging=1 ;;
-            esac
-        fi
-    done
+    status=$(state_get BAT_STATUS)
+
+charging=0
+[[ "$status" == "CHARGING" || "$status" == "FULL" ]] && charging=1
 
     # pause douce avant throttling
     (( temp >= MAX_TEMP-3 )) && return 0
 
     # batterie basse seulement si NON branché
-    if (( bat <= 22 )) && (( charging == 0 )); then
+    if (( bat <= BATTERY_ECO )) && (( charging == 0 )); then
         return 0
     fi
 
@@ -650,22 +672,19 @@ thermal_pause_needed() {
 }
 
 thermal_hysteresis() {
-
     local temp state
-    temp=$(state_get CPU_TEMP)
-[[ -z "$temp" ]] && temp=$(get_cpu_temp)
+    temp=$(get_cached_cpu_temp)
     state=$(state_get THERMAL_STATE)
-
     : "${state:=normal}"
 
     # Passage en mode chaud
-    if (( temp >= 66 )) && [[ "$state" != "hot" ]]; then
+    if (( temp >= HOT_THRESHOLD )) && [[ "$state" != "hot" ]]; then
         state_set THERMAL_STATE hot
         return 1
     fi
 
     # Retour en mode normal uniquement si bien refroidi
-    if (( temp <= 58 )) && [[ "$state" != "normal" ]]; then
+    if (( temp <= COOL_THRESHOLD )) && [[ "$state" != "normal" ]]; then
         state_set THERMAL_STATE normal
         return 1
     fi
@@ -675,13 +694,8 @@ thermal_hysteresis() {
 
 adaptive_loop_delay() {
 
-    local temp bat running
-
-    temp=$(state_get CPU_TEMP)
-    [[ -z "$temp" ]] && temp=$(get_cpu_temp)
-
-bat=$(state_get BAT_LVL)
-[[ -z "$bat" ]] && bat=$(get_battery)
+    local temp running
+    temp=$(get_cached_cpu_temp)
 
     if is_miner_running; then
         running=1
@@ -689,25 +703,31 @@ bat=$(state_get BAT_LVL)
         running=0
     fi
 
-    # Miner actif stable
+    # Miner actif et froid
     if (( running == 1 )) && (( temp < 58 )); then
-    echo 60
-    return
-fi
+        echo 60
+        return
+    fi
 
-    # Température moyenne
-    if (( temp >= 60 && temp < 66 )); then
+    # Température modérée
+    if (( temp >= 58 && temp < 65 )); then
+        echo 30
+        return
+    fi
+
+    # Température élevée
+    if (( temp >= 65 && temp < 70 )); then
         echo 15
         return
     fi
 
-    # Chaud → surveiller plus souvent
-    if (( temp >= 66 )); then
-        echo 15
+    # Très chaud
+    if (( temp >= 70 )); then
+        echo 10
         return
     fi
 
-    # Idle ou pause
+    # Idle
     echo 35
 }
 
@@ -758,12 +778,12 @@ get_cpu_cluster_mode() {
         echo "MIXED"
     fi
 }
-
 power_curve_best_threads() {
 
     local best_thr=0
     local best_hs=0
     local line thr hs mode
+
     mode=$(get_cpu_cluster_mode)
 
     while read -r line; do
@@ -785,23 +805,34 @@ power_curve_best_threads() {
             best_thr="$thr"
         fi
 
-    done < <(grep "^POWER_${mode}_" "$STATE_FILE" 2>/dev/null)
+    done < "$STATE_FILE"
 
     echo "$best_thr"
 }
 
 metrics_loop() {
 
+    local last_flush=0
+    local now
+
     while true; do
 
-        state_set HS "$(get_hashrate)"
-        state_set ACC "$(get_accepted)"
-        state_set BAT_LVL "$(get_battery)"
-        state_set THR "$(get_threads)"
+        now=$(date +%s)
 
+        # Mise à jour thermique toujours active
         update_thermal_cache
 
-        sleep 120
+        # Flush complet toutes les 2 minutes
+        if (( now - last_flush >= 120 )); then
+            state_set HS "$(get_hashrate)"
+            state_set ACC "$(get_accepted)"
+            state_set BAT_LVL "$(get_battery)"
+            state_set THR "$(get_threads)"
+            last_flush=$now
+        fi
+
+        sleep 30 &
+wait $!
     done
 }
 
