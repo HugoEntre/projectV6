@@ -71,6 +71,7 @@ cleanup() {
 
     # Tuer enfants du shell courant
     pkill -TERM -P $$ 2>/dev/null || true
+[[ -n "$METRICS_PID" ]] && kill "$METRICS_PID" 2>/dev/null || true
 
     # Attendre extinction propre
     sleep 2
@@ -94,7 +95,7 @@ trap cleanup EXIT INT TERM
 LAST_REFRESH=${LAST_REFRESH:-$(date +%s)}
 LAST_NET=0
 
-trap cleanup EXIT INT TERM
+pkill -f metrics_loop 2>/dev/null || true
 
 # --- START SERVICES ---
 wakelock_guard

@@ -37,7 +37,7 @@ cd "$TARGET_DIR"
 #--- DEPENDANCES ---
 
 echo "🔐 Installation dépendances..."
-pkg upgrade -y >/dev/null 2>&1 || true
+
 pkg install -y dos2unix jq util-linux termux-api git coreutils sed grep gawk inotify-tools >/dev/null 2>&1 || true
 
 #--- INOTIFY FLAG ---

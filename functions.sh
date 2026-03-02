@@ -164,18 +164,32 @@ detect_cpu_topology() {
 # ==================================================
 
 get_cpu_temp() {
-    local zone type raw temp max=0 count=0 sum=0
 
-    [ -d /sys/class/thermal ] || { echo 0; return 1; }
+    local zone type raw temp
+    local temps=()
+
+    [ -d /sys/class/thermal ] || { echo 35; return; }
 
     for zone in /sys/class/thermal/thermal_zone*; do
+
         [ -r "$zone/type" ] || continue
         read -r type < "$zone/type" 2>/dev/null || continue
-        type=$(echo "$type" | tr "[:upper:]" "[:lower:]")
+        type=$(echo "$type" | tr '[:upper:]' '[:lower:]')
 
+        # --- Inclusion CPU uniquement ---
         case "$type" in
-            *cpu*|*cluster*|*tsens*|*soc*) ;;
-            *) continue ;;
+            cpu*|cpuss*|cluster*|tsens*|soc*)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        # --- Exclusions sûres ---
+        case "$type" in
+            *step*|*skin*|*camera*|*battery*|*modem*|*gpuss*|*ddr*|*wlan*|*pa*|*audio*|*video*)
+                continue
+                ;;
         esac
 
         [ -r "$zone/temp" ] || continue
@@ -183,22 +197,36 @@ get_cpu_temp() {
         [[ "$raw" =~ ^[0-9]+$ ]] || continue
 
         temp=$raw
-        [ "$temp" -gt 100000 ] && temp=$((temp / 1000))
 
-        # plage réaliste Android
-        if (( temp >= 25 && temp <= 95 )); then
-            sum=$((sum + temp))
-            count=$((count + 1))
-            (( temp > max )) && max=$temp
+        # --- Normalisation unités ---
+        if (( temp > 1000000 )); then
+            temp=$((temp/1000000))
+        elif (( temp > 1000 )); then
+            temp=$((temp/1000))
         fi
+
+        # --- Plage réaliste CPU ---
+        (( temp < 25 || temp > 100 )) && continue
+
+        temps+=("$temp")
     done
 
-    # moyenne anti-spike
-    if (( count > 0 )); then
-        echo $((sum / count))
-    else
-        echo 0
-    fi
+    # --- Aucun capteur valide ---
+    (( ${#temps[@]} == 0 )) && { echo 35; return; }
+
+    # --- Trier décroissant ---
+    IFS=$'\n' temps=($(sort -nr <<<"${temps[*]}"))
+    unset IFS
+
+    # --- Moyenne des 3 plus chaudes CPU ---
+    local sum=0 count=0
+    for t in "${temps[@]}"; do
+        (( sum += t ))
+        (( count++ ))
+        (( count == 3 )) && break
+    done
+
+    echo $(( sum / count ))
 }
 
 get_cached_cpu_temp() {
@@ -728,16 +756,8 @@ elif (( little_count <= 2 )); then
 else
     echo "MIXED"
 fi
-
-    # heuristique simple Android
-    if (( big == 0 )); then
-        echo "LITTLE"
-    elif (( little <= 2 )); then
-        echo "BIG"
-    else
-        echo "MIXED"
-    fi
 }
+
 power_curve_best_threads() {
 
     local best_thr=0
