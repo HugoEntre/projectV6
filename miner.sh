@@ -83,7 +83,7 @@ fi
     echo "🚀 Lancement XMRig (Threads: $threads, Mode: $rx_mode)"
 CPU_MASK=$(get_dynamic_cpu_mask)
 
-if [[ -n "$CPU_MASK" ]] && command -v taskset >/dev/null 2>&1 && (( threads > 2 )); then
+if [[ -n "$CPU_MASK" ]] && command -v taskset >/dev/null 2>&1 && taskset -c 0 echo >/dev/null 2>&1 && (( threads > 2 )); then
     CMD=(taskset -c "$CPU_MASK" "$XMRIG_PATH")
 else
     CMD=("$XMRIG_PATH")
@@ -98,6 +98,7 @@ fi
         --cpu-priority=2 \
         --randomx-mode="$rx_mode" \
         --randomx-no-numa \
+        --randomx-init=1
         --cpu-no-yield \
         --log-file="$LOGFILE" \
         --print-time="${PRINT_TIME:-60}" &
@@ -151,6 +152,15 @@ if (( now - learn_time < 90 )); then
 fi
 
 power_curve_learn
+
+hs=$(get_hashrate)
+[[ "$hs" =~ ^[0-9.]+$ ]] || hs=0
+if awk "BEGIN{exit !($hs < 5)}"; then
+    echo "⚠️ Hashrate trop bas — restart"
+    kill "$xmrig_pid"
+    break
+fi
+
 thread_migration_guard "$xmrig_pid"
 # --- THERMAL HYSTERESIS PRO ---
 

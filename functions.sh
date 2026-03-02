@@ -164,90 +164,41 @@ detect_cpu_topology() {
 # ==================================================
 
 get_cpu_temp() {
-    # Initialisation des variables
-    local temp_value=0
-    local max_temp=0
-    local type_name=""
-    local temp_raw=""
-    
-    # Vérification de l'existence du répertoire thermal
-    if [ ! -d "/sys/class/thermal" ]; then
-        echo "0"
-        return 1
-    fi
-    
-    # Parcours des zones thermiques
-    for zone in /sys/class/thermal/thermal_zone[0-9]*; do
-        # Vérification que le chemin existe et est accessible
-        [ -e "$zone" ] || continue
-        
-        # Lecture sécurisée du type avec timeout et vérification
-        if [ -r "$zone/type" ] && [ -f "$zone/type" ]; then
-            type_name=$(cat "$zone/type" 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '\0')
-        else
-            continue
-        fi
-        
-        # Filtrage intelligent des zones CPU
-        case "$type_name" in
-    *cpu*|*cluster*|*tsens*|*apc*|*soc*|*core*|*cpuss*|*cpux*|\
-    big|little|ap|g3d)
-                # Exclusion des types non-CPU
-                case "$type_name" in
-                    *battery*|*charger*|*pmic*|*ambient*|*skin*|*quiet*|*step*|*lowf*|\
-                    *ddr*|*wlan*|*wifi*|*battery*|*charger*|*bcl*|*xo*|*pmi*|*vf*|*camera*)
-                        continue
-                        ;;
-                esac
-                ;;
-            *)
-                continue
-                ;;
+    local zone type raw temp max=0 count=0 sum=0
+
+    [ -d /sys/class/thermal ] || { echo 0; return 1; }
+
+    for zone in /sys/class/thermal/thermal_zone*; do
+        [ -r "$zone/type" ] || continue
+        read -r type < "$zone/type" 2>/dev/null || continue
+        type=$(echo "$type" | tr "[:upper:]" "[:lower:]")
+
+        case "$type" in
+            *cpu*|*cluster*|*tsens*|*soc*) ;;
+            *) continue ;;
         esac
-        
-        # Lecture sécurisée de la température
-        if [ -r "$zone/temp" ] && [ -f "$zone/temp" ]; then
-            temp_raw=$(cat "$zone/temp" 2>/dev/null | tr -d '\0')
-        else
-            continue
-        fi
-        
-        # Validation stricte de la valeur
-        case "$temp_raw" in
-            ''|*[!0-9-]*)
-                continue
-                ;;
-        esac
-        
-        # Conversion en nombre
-        temp_value=$((temp_raw + 0))
-        
-        # Normalisation de l'unité (millidegrés → degrés)
-        if [ "$temp_value" -gt 1000000 ]; then
-    temp_value=$((temp_value / 1000000))
-elif [ "$temp_value" -gt 1000 ]; then
-    temp_value=$((temp_value / 1000))
-fi
-        
-        # Validation des plages de température réalistes (-40°C à 150°C)
-        if [ "$temp_value" -lt -40 ] || [ "$temp_value" -gt 150 ]; then
-            continue
-        fi
-        
-        # Mise à jour du maximum
-        if [ "$temp_value" -gt "$max_temp" ]; then
-            # Vérification supplémentaire : ignorer les valeurs anormalement hautes
-            if [ "$temp_value" -lt 120 ]; then
-                max_temp=$temp_value
-            fi
+
+        [ -r "$zone/temp" ] || continue
+        read -r raw < "$zone/temp" 2>/dev/null || continue
+        [[ "$raw" =~ ^[0-9]+$ ]] || continue
+
+        temp=$raw
+        [ "$temp" -gt 100000 ] && temp=$((temp / 1000))
+
+        # plage réaliste Android
+        if (( temp >= 25 && temp <= 95 )); then
+            sum=$((sum + temp))
+            count=$((count + 1))
+            (( temp > max )) && max=$temp
         fi
     done
-    
-    # Retourner la température ou 0 si aucune trouvée
-    echo "$max_temp"
-    
-    # Code de retour : 0 si température trouvée, 1 sinon
-    [ "$max_temp" -gt 0 ] && return 0 || return 1
+
+    # moyenne anti-spike
+    if (( count > 0 )); then
+        echo $((sum / count))
+    else
+        echo 0
+    fi
 }
 
 get_cached_cpu_temp() {
@@ -646,7 +597,7 @@ compute_optimal_threads() {
     fi
 
     # Zone optimale accepted
-    echo $(( total*75/100 ))
+    echo $(( total*65/100 ))
 }
 
 thermal_pause_needed() {
@@ -767,7 +718,16 @@ get_cpu_cluster_mode() {
 
     local little big
     little=$(echo "$mask" | tr ',' '\n' | wc -l)
-    big=$(echo "$mask" | grep -c '[4-9]' 2>/dev/null)
+    big_count=$(echo "$CPU_BIG" | tr ',' '\n' | wc -l)
+little_count=$(echo "$CPU_LITTLE" | tr ',' '\n' | wc -l)
+
+if (( big_count == 0 )); then
+    echo "LITTLE"
+elif (( little_count <= 2 )); then
+    echo "BIG"
+else
+    echo "MIXED"
+fi
 
     # heuristique simple Android
     if (( big == 0 )); then
