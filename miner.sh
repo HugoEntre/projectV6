@@ -42,12 +42,20 @@ flock -n 9 || {
 
     worker="$(get_phone_model)"
     ref="${REFERRAL_CODE:-dxsf-1e9m}"
+    threads=$(power_curve_best_threads)
+
+if [[ ! "$threads" =~ ^[0-9]+$ ]] || (( threads < 3 )); then
     threads=$(compute_optimal_threads)
+fi
+
     bat_level=$(state_get LAST_BAT_VALUE)
 [[ -z "$bat_level" ]] && bat_level=$(get_battery)
-    rx_mode="fast"
 
-    (( bat_level <= 25 )) && rx_mode="light"
+     if (( bat_level <= 25 )); then
+    rx_mode="light"
+else
+    rx_mode="fast"
+fi
 
     user_id="${MY_WALLET}.${worker}#${ref}"
     target_id="$user_id"
@@ -83,25 +91,41 @@ fi
     echo "🚀 Lancement XMRig (Threads: $threads, Mode: $rx_mode)"
 CPU_MASK=$(get_dynamic_cpu_mask)
 
+if [[ -z "$CPU_MASK" ]]; then
+    CPU_MASK="0-$(($(nproc)-1))"
+fi
+
 if [[ -n "$CPU_MASK" ]] && command -v taskset >/dev/null 2>&1 && taskset -c 0 echo >/dev/null 2>&1 && (( threads > 2 )); then
     CMD=(taskset -c "$CPU_MASK" "$XMRIG_PATH")
 else
     CMD=("$XMRIG_PATH")
 fi
 
-    nice -n 10 "${CMD[@]}" \
-        -o "$POOL_URL" \
-        -u "$target_id" \
-        -a rx/0 \
-        --donate-level="${DONATION_XMRIG:-1}" \
-        --threads="$threads" \
-        --cpu-priority=2 \
-        --randomx-mode="$rx_mode" \
-        --randomx-no-numa \
-        --randomx-init=1
-        --cpu-no-yield \
-        --log-file="$LOGFILE" \
-        --print-time="${PRINT_TIME:-60}" &
+export OMP_NUM_THREADS="$threads"
+export MALLOC_ARENA_MAX=2
+export OMP_WAIT_POLICY=PASSIVE
+
+    nice -n 5 "${CMD[@]}" \
+  -o "$POOL_URL" \
+  -u "$target_id" \
+  -a rx/0 \
+  --donate-level="${DONATION_XMRIG:-1}" \
+  --threads="$threads" \
+  --cpu-max-threads-hint=100 \
+  --cpu-priority=5 \
+  --cpu-no-yield \
+  --cpu-affinity="$CPU_MASK" \
+  --asm=armv8 \
+  --randomx-init=2 \
+  --randomx-cache-qos \
+  --randomx-mode="$rx_mode" \
+  --randomx-no-numa \
+  --no-huge-pages \
+  --no-1gb-pages \
+  --randomx-1gb-pages=0 \
+  --randomx-wrmsr=0 \
+  --log-file="$LOGFILE" \
+  --print-time="${PRINT_TIME:-60}" &
 
     xmrig_pid=$!
     # Initialisation phase apprentissage
@@ -111,10 +135,11 @@ state_set LEARN_TIME "$(date +%s)"
 pin_xmrig_threads "$xmrig_pid"
     sleep 3
 pin_xmrig_threads_smart "$xmrig_pid"
-    state_set LAST_ACC $(get_accepted)
+    state_set LAST_ACC "$(get_accepted)"
 
     last_threads="$threads"
     stable_counter=0
+    low_hash_counter=0
 
     # ==================================================
     # MONITORING THERMIQUE STABLE
@@ -153,15 +178,49 @@ fi
 
 power_curve_learn
 
+acc_now=$(get_accepted)
+acc_last=$(state_get LAST_ACC)
+: "${acc_last:=0}"
+
+if (( acc_now - acc_last > MAX_ACCEPTED_GAP )); then
+    echo "⚠️ Gap shares anormal — restart miner"
+    kill -TERM "$xmrig_pid" 2>/dev/null || true
+wait "$xmrig_pid" 2>/dev/null || true
+    break
+fi
+
+state_set LAST_ACC "$acc_now"
+
 hs=$(get_hashrate)
-[[ "$hs" =~ ^[0-9.]+$ ]] || hs=0
 if awk "BEGIN{exit !($hs < 5)}"; then
-    echo "⚠️ Hashrate trop bas — restart"
+    ((low_hash_counter++))
+else
+    low_hash_counter=0
+fi
+
+new_bat=$(get_cached_battery_level)
+
+if (( new_bat <= 25 )) && [[ "$rx_mode" == "fast" ]]; then
+    echo "🔋 Batterie faible → passage mode LIGHT"
     kill "$xmrig_pid"
     break
 fi
 
-thread_migration_guard "$xmrig_pid"
+if (( new_bat >= 35 )) && [[ "$rx_mode" == "light" ]]; then
+    echo "🔋 Batterie remontée → passage mode FAST"
+    kill "$xmrig_pid"
+    break
+fi
+
+if (( low_hash_counter >= 3 )); then
+    echo "⚠️ Hashrate bas persistant — restart"
+    kill -TERM "$xmrig_pid" 2>/dev/null || true
+wait "$xmrig_pid" 2>/dev/null || true
+    break
+fi
+
+(( RANDOM % 5 == 0 )) && thread_migration_guard "$xmrig_pid"
+
 # --- THERMAL HYSTERESIS PRO ---
 
     if ! thermal_hysteresis; then
@@ -179,10 +238,12 @@ else
     ((stable_counter>0 && stable_counter--))
 fi
 
-        if (( stable_counter >= 8 )) && (( last_threads > 2 )); then
-            echo "🌡️ Ajustement thermique stable : $last_threads -> $current_threads"
-            last_threads="$current_threads"
-        fi
+        if (( stable_counter >= 8 )) && [[ "$current_threads" =~ ^[0-9]+$ ]] && (( current_threads != last_threads )); then
+    echo "🌡️ Ajustement thermique appliqué : $last_threads -> $current_threads"
+    last_threads="$current_threads"
+    kill -TERM "$xmrig_pid" 2>/dev/null || true
+    break
+fi
 
         delay=$(adaptive_loop_delay)
 

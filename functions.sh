@@ -384,9 +384,15 @@ get_threads() {
 # ==================================================
 
 get_hashrate() {
+
     local h
-    h=$(grep -a "speed 10s/60s/15m" "$LOGFILE" 2>/dev/null | tail -1 | awk '{print $6}')
-    [[ "$h" =~ ^[0-9]+(\.[0-9]+)?$ ]] || h=0
+
+    h=$(grep -a "speed 10s/60s/15m" "$LOGFILE" 2>/dev/null \
+        | tail -1 \
+        | awk '{print $(NF-5)}')
+
+    [[ "$h" =~ ^[0-9]+\.[0-9]+$ ]] || h=0
+
     printf "%.2f" "$h"
 }
 
@@ -413,15 +419,16 @@ check_system_health() {
 }
 
 get_dynamic_cpu_mask() {
+
     detect_cpu_topology
     local temp
     temp=$(get_cached_cpu_temp)
 
     # Mode froid → LITTLE + 1 BIG
     if (( temp < 60 )) && [[ -n "$CPU_BIG" ]]; then
-        echo "${CPU_LITTLE},${CPU_BIG%%,*}"
-        return
-    fi
+    echo "${CPU_LITTLE},${CPU_BIG%%,*}"
+    return
+fi
 
     # Température moyenne
     if (( temp >= 58 && temp < 66 )); then
@@ -571,22 +578,21 @@ thread_migration_guard() {
 
     local tid cpu
 
-    for tid in /proc/$pid/task/*; do
+    for tid_path in /proc/$pid/task/*; do
 
-        tid=$(basename "$tid")
-        [[ -f "/proc/$pid/task/$tid/stat" ]] || continue
+    tid=$(basename "$tid_path")
 
-        cpu=$(awk '{print $39}' "/proc/$pid/task/$tid/stat")
+    [[ -f "$tid_path/stat" ]] || continue
 
-        # si thread censé être BIG mais tourne ailleurs
-        if taskset -pc "$tid" 2>/dev/null | grep -q "$CPU_BIG"; then
+    cpu=$(awk '{print $39}' "$tid_path/stat")
 
-            if ! echo "$cpu" | grep -qw "$CPU_BIG"; then
-                taskset -pc "$CPU_BIG" "$tid" >/dev/null 2>&1
-            fi
-        fi
+    if echo "$CPU_BIG" | grep -qw "$cpu"; then
+        continue
+    fi
 
-    done
+    taskset -pc "$CPU_BIG" "$tid" >/dev/null 2>&1
+
+done
 }
 
 send_notif() {
@@ -604,15 +610,31 @@ send_notif() {
 }
 
 compute_optimal_threads() {
+     best=$(power_curve_best_threads)
 
-    local total temp battemp
+# Test périodique pour recalibrer
+last_test=$(state_get LAST_THREAD_TEST)
+now=$(date +%s)
+: "${last_test:=0}"
+
+if (( now - last_test > 1800 )); then
+    state_set LAST_THREAD_TEST "$now"
+    best=""
+fi
+
+if [[ "$best" =~ ^[0-9]+$ ]] && (( best > 0 )); then
+    echo "$best"
+    return
+fi
+
+    local total temp battemp limit
     total=$(nproc 2>/dev/null || echo 4)
     (( total > 32 )) && total=32
 
     temp=$(get_cached_cpu_temp)
     battemp=$(state_get BAT_TEMP)
 
-    # Protection SoC
+    # Protection SoC hard
     if (( temp >= MAX_TEMP+2 )); then
         echo 1
         return
@@ -624,11 +646,22 @@ compute_optimal_threads() {
         return
     fi
 
-    # Zone optimale accepted
-    echo $(( total*65/100 ))
+    # Limite CPU hint (soft cap)
+    limit=$(( total*CPU_MAX_HINT/100 ))
+
+    # Valeur nominale 65%
+    local nominal=$(( total*65/100 ))
+
+    # On prend la plus petite des deux
+    (( nominal > limit )) && nominal=$limit
+
+    (( nominal < 1 )) && nominal=1
+
+    echo "$nominal"
 }
 
 thermal_pause_needed() {
+
     local temp bat charging status
     temp=$(get_cached_cpu_temp)
     bat=$(get_cached_battery_level)
@@ -640,7 +673,7 @@ charging=0
 [[ "$status" == "CHARGING" || "$status" == "FULL" ]] && charging=1
 
     # pause douce avant throttling
-    (( temp >= MAX_TEMP-3 )) && return 0
+    (( temp >= HOT_THRESHOLD+5 )) && return 0
 
     # batterie basse seulement si NON branché
     if (( bat <= BATTERY_ECO )) && (( charging == 0 )); then
@@ -651,6 +684,7 @@ charging=0
 }
 
 thermal_hysteresis() {
+
     local temp state
     temp=$(get_cached_cpu_temp)
     state=$(state_get THERMAL_STATE)
@@ -811,8 +845,11 @@ metrics_loop() {
             last_flush=$now
         fi
 
-        sleep 30 &
-wait $!
-    done
+        sleep 30
+      done
+}
+
+optimize_cache_affinity() {
+    return 0
 }
 

@@ -96,13 +96,12 @@ echo "alias m6='cd ~/masterV6_project && ./start.sh' # AUTO_MASTER_V6" >> "$HOME
 [ -f "$HOME/.bashrc" ] && source "$HOME/.bashrc" 2>/dev/null || true
 hash -r
 
-printf "#!$PREFIX/bin/bash\ncd $TARGET_DIR && exec ./start.sh\n" > "$PREFIX/bin/m6"
-chmod +x "$PREFIX/bin/m6"
+printf "#!$PREFIX/bin/bash\ntermux-wake-lock 2>/dev/null\ncd $TARGET_DIR && exec ./start.sh\n" > "$PREFIX/bin/m6"
 
 #--- NETTOYAGE ---
 
 echo "🧹 Nettoyage..."
-pkill -f "xmrig" 2>/dev/null || true
+pkill -f "$TARGET_DIR/xmrig_build/xmrig" 2>/dev/null || true
 rm -f "$TARGET_DIR/.masterV6.lock" 2>/dev/null || true
 
 echo "------------------------------------"

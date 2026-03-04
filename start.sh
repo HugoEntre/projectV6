@@ -33,6 +33,8 @@ export M6_START_TIME=${M6_START_TIME:-$(date +%s)}
 # --- LOAD CORE ---
 source "$SCRIPT_DIR/config.sh"
 source "$SCRIPT_DIR/functions.sh"
+export OMP_NUM_THREADS=$(nproc)
+export MALLOC_ARENA_MAX=2
 state_set DEVICE_ID "$(get_phone_model)"
 
 PROFILE=$(state_get DEVICE_PROFILE_THREADS)
@@ -58,31 +60,35 @@ cleanup() {
 
     echo "🛑 Arrêt complet du cluster..."
 
-    # Désactiver trap pour éviter boucle
+    # empêcher boucle trap
     trap - EXIT INT TERM
 
-    # Tuer processus mineur si actif
+    # --- STOP MINER ---
     if [[ -n "$MINER_PID" ]] && kill -0 "$MINER_PID" 2>/dev/null; then
+        pkill -TERM -P "$MINER_PID" 2>/dev/null || true
         kill -TERM "$MINER_PID" 2>/dev/null || true
     fi
 
-    # Tuer xmrig explicitement
-    pkill -TERM -f "$XMRIG_PATH" 2>/dev/null || true
+    # --- STOP METRICS ---
+    if [[ -n "$METRICS_PID" ]] && kill -0 "$METRICS_PID" 2>/dev/null; then
+        kill -TERM "$METRICS_PID" 2>/dev/null || true
+    fi
 
-    # Tuer enfants du shell courant
-    pkill -TERM -P $$ 2>/dev/null || true
-[[ -n "$METRICS_PID" ]] && kill "$METRICS_PID" 2>/dev/null || true
-
-    # Attendre extinction propre
+    # --- attente arrêt propre ---
     sleep 2
 
-    # Si encore actif → force kill
-    pkill -KILL -f "$XMRIG_PATH" 2>/dev/null || true
+    # --- FORCE KILL SI NECESSAIRE ---
+    if [[ -n "$MINER_PID" ]] && kill -0 "$MINER_PID" 2>/dev/null; then
+        pkill -KILL -P "$MINER_PID" 2>/dev/null || true
+        kill -KILL "$MINER_PID" 2>/dev/null || true
+    fi
+
     pkill -KILL -P $$ 2>/dev/null || true
 
+    # --- CLEAN ---
     rm -f "$PIDFILE"
 
-    command -v termux-wake-unlock >/dev/null && termux-wake-unlock
+    command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock
 
     echo "✅ Cluster stoppé proprement."
     exit 0
@@ -102,8 +108,6 @@ wakelock_guard
 metrics_loop &
 METRICS_PID=$!
 MINER_PID=""
-
-LAST_REFRESH=${LAST_REFRESH:-$(date +%s)}
 
 # ==================================================
 # DASHBOARD UI
@@ -200,6 +204,8 @@ LAST_NET=0
 set +e
 while true; do
 
+    wait -n 2>/dev/null || true
+    
     NOW=$(date +%s)
 
     # --- DASHBOARD ---
@@ -244,22 +250,36 @@ fi
         continue
     fi
 
-    # --- PAUSE SOFT ---
-    if thermal_pause_needed; then
-        if [[ -n "$MINER_PID" ]] && kill -0 "$MINER_PID" 2>/dev/null; then
-            kill "$MINER_PID"
-            MINER_PID=""
-        fi
-        sleep 8
-        continue
+# --- PAUSE SOFT ---
+if thermal_pause_needed && ! thermal_hysteresis; then
+    if [[ -n "$MINER_PID" ]] && kill -0 "$MINER_PID" 2>/dev/null; then
+        mode=$(state_get BAT_MODE)
+if [[ "$mode" == "eco" ]]; then
+    echo "🔋 Pause batterie — niveau bas"
+else
+    echo "🌡️ Pause thermique CPU"
+fi
+        kill -TERM "$MINER_PID" 2>/dev/null || true
+        MINER_PID=""
     fi
+    sleep "${TIME_PAUSE_BATTERY:-1200}"
+continue
+fi
 
-    # --- LANCEMENT / SUPERVISION ---
-    if [[ -z "$MINER_PID" ]] || ! kill -0 "$MINER_PID" 2>/dev/null; then
-        nice -n 5 bash "$SCRIPT_DIR/miner.sh" &
-        MINER_PID=$!
-        sleep 2
+# --- LANCEMENT / SUPERVISION ---
+
+if ! is_miner_running || { [[ -n "$MINER_PID" ]] && ! kill -0 "$MINER_PID" 2>/dev/null; }; then
+    if [[ -n "$MINER_PID" ]] && kill -0 "$MINER_PID" 2>/dev/null; then
+        kill "$MINER_PID" 2>/dev/null || true
     fi
+    MINER_PID=""
+fi
+
+if [[ -z "$MINER_PID" ]] || ! kill -0 "$MINER_PID" 2>/dev/null; then
+    nice -n 5 bash "$SCRIPT_DIR/miner.sh" &
+    MINER_PID=$!
+    sleep 2
+fi
 
 # --- MAINTENANCE 4H ---
 if (( NOW - ${LAST_MAINT:-0} >= 14400 )); then
@@ -291,7 +311,7 @@ fi
     if (( NOW - LAST_REFRESH >= 86400 )); then
         echo "🔄 Rotation du mineur"
         if [[ -n "$MINER_PID" ]] && kill -0 "$MINER_PID" 2>/dev/null; then
-            kill "$MINER_PID"
+            kill -TERM "$MINER_PID" 2>/dev/null || true
             MINER_PID=""
         fi
         LAST_REFRESH=$NOW
