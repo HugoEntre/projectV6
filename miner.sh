@@ -14,7 +14,8 @@ cleanup() {
     echo -e "\n🛑 Arrêt du moteur de minage..."
     pkill -P $$ 2>/dev/null || true
 }
-trap cleanup EXIT SIGINT SIGTERM SIGHUP
+trap cleanup EXIT SIGINT SIGTERM
+trap '' SIGHUP
 
 # --- WALLET ---
 WALLET_FILE="$HOME/.masterV6_wallet"
@@ -105,7 +106,7 @@ export OMP_NUM_THREADS="$threads"
 export MALLOC_ARENA_MAX=2
 export OMP_WAIT_POLICY=PASSIVE
 
-    nice -n 5 "${CMD[@]}" \
+  nice -n 5 "${CMD[@]}" \
   -o "$POOL_URL" \
   -u "$target_id" \
   -a rx/0 \
@@ -113,21 +114,29 @@ export OMP_WAIT_POLICY=PASSIVE
   --threads="$threads" \
   --cpu-max-threads-hint=100 \
   --cpu-priority=5 \
-  --cpu-no-yield \
-  --cpu-affinity="$CPU_MASK" \
-  --asm=armv8 \
-  --randomx-init=2 \
+  --cpu-yield \
+  --cpu-memory-pool=1 \
+  --randomx-1gb-pages \
+  --randomx-init=1 \
   --randomx-cache-qos \
   --randomx-mode="$rx_mode" \
   --randomx-no-numa \
+  --randomx-no-rdmsr\
   --no-huge-pages \
-  --no-1gb-pages \
-  --randomx-1gb-pages=0 \
-  --randomx-wrmsr=0 \
+  --keepalive \
+  --retry-pause=5 \
+  --retries=999999 \
   --log-file="$LOGFILE" \
   --print-time="${PRINT_TIME:-60}" &
 
     xmrig_pid=$!
+disown "$xmrig_pid"
+sleep 10
+if ! kill -0 "$xmrig_pid" 2>/dev/null; then
+    echo "⚠️ xmrig crash early — relance"
+    return
+fi
+
     # Initialisation phase apprentissage
 state_set LEARN_TIME "$(date +%s)"
     [[ -z "$xmrig_pid" ]] && return
@@ -156,9 +165,7 @@ if [[ "$mode" == "1" ]]; then
     : "${last:=0}"
     if (( now > last )); then
         inc=$(( now - last ))
-        cur=$(state_get OWNER_ACCEPTED)
-        : "${cur:=0}"
-        state_set OWNER_ACCEPTED $(( cur + inc ))
+        state_add OWNER_ACCEPTED "$inc"
         state_set LAST_ACC "$now"
     fi
 fi
@@ -182,7 +189,9 @@ acc_now=$(get_accepted)
 acc_last=$(state_get LAST_ACC)
 : "${acc_last:=0}"
 
-if (( acc_now - acc_last > MAX_ACCEPTED_GAP )); then
+gap=$(( acc_now - acc_last ))
+
+if (( gap > MAX_ACCEPTED_GAP )) && (( gap > 0 )); then
     echo "⚠️ Gap shares anormal — restart miner"
     kill -TERM "$xmrig_pid" 2>/dev/null || true
 wait "$xmrig_pid" 2>/dev/null || true
@@ -192,10 +201,17 @@ fi
 state_set LAST_ACC "$acc_now"
 
 hs=$(get_hashrate)
-if awk "BEGIN{exit !($hs < 5)}"; then
+
+if awk "BEGIN{exit !($hs < 10)}"; then
     ((low_hash_counter++))
 else
     low_hash_counter=0
+fi
+
+if (( low_hash_counter >= 4 )); then
+    echo "⚠️ xmrig freeze confirmé"
+    kill -TERM "$xmrig_pid"
+    break
 fi
 
 new_bat=$(get_cached_battery_level)
@@ -238,7 +254,7 @@ else
     ((stable_counter>0 && stable_counter--))
 fi
 
-        if (( stable_counter >= 8 )) && [[ "$current_threads" =~ ^[0-9]+$ ]] && (( current_threads != last_threads )); then
+        if (( stable_counter >= 15 )) && [[ "$current_threads" =~ ^[0-9]+$ ]] && (( current_threads != last_threads )); then
     echo "🌡️ Ajustement thermique appliqué : $last_threads -> $current_threads"
     last_threads="$current_threads"
     kill -TERM "$xmrig_pid" 2>/dev/null || true

@@ -1,5 +1,9 @@
 #!/data/data/com.termux/files/usr/bin/bash
-set -Eeo pipefail
+set -Eo pipefail
+shopt -s lastpipe
+ulimit -n 4096
+ulimit -u 4096
+trap '' SIGHUP
 
 # ==================================================
 # MASTER V6 - START ENGINE FINAL MOBILE STABLE
@@ -33,12 +37,13 @@ export M6_START_TIME=${M6_START_TIME:-$(date +%s)}
 # --- LOAD CORE ---
 source "$SCRIPT_DIR/config.sh"
 source "$SCRIPT_DIR/functions.sh"
+trap 'echo "[ENGINE ERROR] line $LINENO command:$BASH_COMMAND $(date)" >> "$SCRIPT_DIR/engine_error.log"' ERR
 export OMP_NUM_THREADS=$(nproc)
 export MALLOC_ARENA_MAX=2
 state_set DEVICE_ID "$(get_phone_model)"
 
 PROFILE=$(state_get DEVICE_PROFILE_THREADS)
-[[ -n "$PROFILE" ]] && echo "📊 Profil CPU appris : ${PROFILE} threads"
+[[ -n "$PROFILE" ]] && echo "📊 Profil CPU appris"
 
 [[ -x "$XMRIG_PATH" ]] || {
     echo "❌ xmrig introuvable"
@@ -94,7 +99,7 @@ cleanup() {
     exit 0
 }
 
-trap cleanup EXIT INT TERM
+trap cleanup INT TERM
 
 # --- SERVICES ---
 
@@ -204,9 +209,15 @@ LAST_NET=0
 set +e
 while true; do
 
-    wait -n 2>/dev/null || true
-    
     NOW=$(date +%s)
+
+# --- WATCHDOG METRICS ---
+if [[ -z "$METRICS_PID" ]] || ! kill -0 "$METRICS_PID" 2>/dev/null; then
+    echo "⚠️ metrics_loop relancé"
+    sleep 2
+    metrics_loop &
+    METRICS_PID=$!
+fi
 
     # --- DASHBOARD ---
     if (( NOW - ${LAST_DASH:-0} >= 60 )); then
@@ -241,6 +252,16 @@ if (( NOW - ${LAST_COMPACT:-0} >= 86400 )); then
 fi
 
     # --- PROTECTION HARD ---
+    
+    hs=$(state_get HS)
+: "${hs:=0}"
+
+if awk "BEGIN{exit !($hs < 5)}"; then
+    echo "⚠️ Miner freeze détecté"
+    kill -TERM "$MINER_PID" 2>/dev/null
+    MINER_PID=""
+fi
+    
     if ! check_system_health; then
         if [[ -n "$MINER_PID" ]] && kill -0 "$MINER_PID" 2>/dev/null; then
             kill "$MINER_PID"
@@ -268,7 +289,7 @@ fi
 
 # --- LANCEMENT / SUPERVISION ---
 
-if ! is_miner_running || { [[ -n "$MINER_PID" ]] && ! kill -0 "$MINER_PID" 2>/dev/null; }; then
+if [[ -z "$MINER_PID" ]] || ! kill -0 "$MINER_PID" 2>/dev/null; then
     if [[ -n "$MINER_PID" ]] && kill -0 "$MINER_PID" 2>/dev/null; then
         kill "$MINER_PID" 2>/dev/null || true
     fi
@@ -287,7 +308,7 @@ if (( NOW - ${LAST_MAINT:-0} >= 14400 )); then
 
     (
         flock -x 9
-        grep -v '^TMP_' "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+        grep -Ev '^(TMP_|POWER_)' "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
         mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
     ) 9>"${STATE_FILE}.lock"
 
@@ -324,7 +345,11 @@ fi
     fi
 
     DELAY=$(adaptive_loop_delay)
-    sleep "$DELAY"
+
+[[ "$DELAY" =~ ^[0-9]+$ ]] || DELAY=10
+(( DELAY < 1 )) && DELAY=10
+
+sleep "$DELAY"
 
 done
 

@@ -91,9 +91,35 @@ state_set() {
     ) 9>"${STATE_FILE}.lock"
 }
 
-state_get() {
+state_add() {
+
     local key="$1"
-    grep "^${key}=" "$STATE_FILE" 2>/dev/null | tail -n1 | cut -d= -f2 || true
+    local inc="$2"
+    local cur tmp="${STATE_FILE}.$$"
+
+    (
+        flock -x 9
+
+        cur=$(grep "^${key}=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2)
+        [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+
+        grep -v "^${key}=" "$STATE_FILE" > "$tmp" 2>/dev/null || true
+        printf '%s=%s\n' "$key" "$((cur + inc))" >> "$tmp"
+
+        mv -f "$tmp" "$STATE_FILE"
+
+    ) 9>"${STATE_FILE}.lock"
+}
+
+state_get() {
+
+    local key="$1"
+
+    (
+        flock -s 9
+        grep "^${key}=" "$STATE_FILE" 2>/dev/null | tail -n1 | cut -d= -f2
+    ) 9<"$STATE_FILE"
+
 }
 
 normalize_wallet() {
@@ -387,22 +413,26 @@ get_hashrate() {
 
     local h
 
-    h=$(grep -a "speed 10s/60s/15m" "$LOGFILE" 2>/dev/null \
-        | tail -1 \
-        | awk '{print $(NF-5)}')
+    h=$(state_get HS)
 
-    [[ "$h" =~ ^[0-9]+\.[0-9]+$ ]] || h=0
+    [[ "$h" =~ ^[0-9.]+$ ]] || h=0
 
     printf "%.2f" "$h"
 }
 
 get_accepted() {
-    [[ -f "$LOGFILE" ]] || { echo 0; return; }
-    tail -n 500 "$LOGFILE" 2>/dev/null | grep -c "accepted" || echo 0
+
+    local a
+
+    a=$(state_get ACC)
+
+    [[ "$a" =~ ^[0-9]+$ ]] || a=0
+
+    echo "$a"
 }
 
 is_miner_running() {
-    pgrep -f xmrig >/dev/null 2>&1
+    kill -0 "$MINER_PID" 2>/dev/null
 }
 
 # ==================================================
@@ -421,23 +451,25 @@ check_system_health() {
 get_dynamic_cpu_mask() {
 
     detect_cpu_topology
-    local temp
+
+    local temp little big
     temp=$(get_cached_cpu_temp)
 
-    # Mode froid → LITTLE + 1 BIG
-    if (( temp < 60 )) && [[ -n "$CPU_BIG" ]]; then
-    echo "${CPU_LITTLE},${CPU_BIG%%,*}"
-    return
-fi
-
-    # Température moyenne
-    if (( temp >= 58 && temp < 66 )); then
+    # Froid → LITTLE uniquement
+    if (( temp < 60 )); then
         echo "$CPU_LITTLE"
         return
     fi
 
-    # Chaud
-    echo "${CPU_LITTLE%%,*}"
+    # Température modérée → LITTLE + 1 BIG
+    little=$(echo "$CPU_LITTLE" | cut -d',' -f1-6)
+
+    if [[ -n "$CPU_BIG" ]]; then
+        big=$(echo "$CPU_BIG" | cut -d',' -f1)
+        echo "${little},${big}"
+    else
+        echo "$little"
+    fi
 }
 
 pin_xmrig_threads() {
@@ -610,7 +642,8 @@ send_notif() {
 }
 
 compute_optimal_threads() {
-     best=$(power_curve_best_threads)
+     local best
+best=$(power_curve_best_threads)
 
 # Test périodique pour recalibrer
 last_test=$(state_get LAST_THREAD_TEST)
@@ -650,7 +683,7 @@ fi
     limit=$(( total*CPU_MAX_HINT/100 ))
 
     # Valeur nominale 65%
-    local nominal=$(( total*65/100 ))
+    local nominal=$(( total*75/100 ))
 
     # On prend la plus petite des deux
     (( nominal > limit )) && nominal=$limit
@@ -758,6 +791,7 @@ power_curve_learn() {
 
     [[ "$thr" =~ ^[0-9]+$ ]] || return 0
     [[ "$hs" =~ ^[0-9.]+$ ]] || return 0
+awk "BEGIN{exit !($hs > 50)}" || return 0
 
     key="POWER_${mode}_${thr}"
 
@@ -769,27 +803,54 @@ power_curve_learn() {
     }')
 
     state_set "$key" "$avg"
+
+    local best_thr best_hs t val
+
+    best_thr="$thr"
+    best_hs="$avg"
+
+    for t in $(seq 1 "$(nproc)"); do
+
+        val=$(state_get "POWER_${mode}_${t}")
+
+        [[ "$val" =~ ^[0-9.]+$ ]] || continue
+
+        if awk "BEGIN{exit !($val > $best_hs)}"; then
+            best_hs="$val"
+            best_thr="$t"
+        fi
+
+    done
+
+    state_set DEVICE_PROFILE_THREADS "$best_thr"
 }
 
 get_cpu_cluster_mode() {
 
-    local mask
+    local mask cpu
     mask=$(get_dynamic_cpu_mask)
 
-    [[ -z "$mask" ]] && echo "MIXED" && return
+    [[ -z "$mask" ]] && { echo "MIXED"; return; }
 
-    local little big
-    little=$(echo "$mask" | tr ',' '\n' | wc -l)
-    big_count=$(echo "$CPU_BIG" | tr ',' '\n' | wc -l)
-little_count=$(echo "$CPU_LITTLE" | tr ',' '\n' | wc -l)
+    local has_big=0
+    local has_little=0
 
-if (( big_count == 0 )); then
-    echo "LITTLE"
-elif (( little_count <= 2 )); then
-    echo "BIG"
-else
-    echo "MIXED"
-fi
+    for cpu in $(echo "$mask" | tr ',' ' '); do
+        if echo "$CPU_BIG" | grep -qw "$cpu"; then
+            has_big=1
+        fi
+        if echo "$CPU_LITTLE" | grep -qw "$cpu"; then
+            has_little=1
+        fi
+    done
+
+    if (( has_big == 1 && has_little == 1 )); then
+        echo "MIXED"
+    elif (( has_big == 1 )); then
+        echo "BIG"
+    else
+        echo "LITTLE"
+    fi
 }
 
 power_curve_best_threads() {
