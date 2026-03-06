@@ -15,3 +15,6 @@
 # Build directory
 masterV6_project/xmrig_build/
 .env_m6
+.m6_state
+*.log
+.masterV6_wallet
