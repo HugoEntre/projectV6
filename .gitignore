@@ -1,0 +1,25 @@
+# logs
+*.log
+
+# state files
+.m6_state
+.m6_state.lock
+
+# wallet
+.masterV6_wallet
+
+# runtime
+*.pid
+.env_m6
+
+# temp
+tmp/
+*.tmp
+
+# build
+xmrig_build/
+xmrig/
+
+# editor
+*.swp
+*.bak
