@@ -120,7 +120,7 @@ export RANDOMX_NO_JIT=0
 
 rx_init=$(( threads / 2 ))
 (( rx_init < 1 )) && rx_init=1
-(( rx_init > 6 )) && rx_init=6
+(( rx_init > 4 )) && rx_init=4
 
 nice -n 5 "${CMD[@]}" \
   -o "$POOL_URL" \
@@ -142,6 +142,7 @@ nice -n 5 "${CMD[@]}" \
   --print-time="${PRINT_TIME:-60}" &
 
 xmrig_pid=$!
+state_set XMRIG_START "$(date +%s)"
 sleep 30
 
 if ! kill -0 "$xmrig_pid" 2>/dev/null; then
@@ -157,6 +158,10 @@ pin_xmrig_threads "$xmrig_pid"
     sleep 3
 pin_xmrig_threads_smart "$xmrig_pid"
     state_set LAST_ACC "$(get_accepted)"
+    
+    # équilibrage cache RandomX
+sleep 5
+pin_xmrig_threads_smart "$xmrig_pid"
 
     last_threads="$threads"
     stable_counter=0
@@ -266,10 +271,49 @@ fi
     break
 fi
 
-        delay=$(adaptive_loop_delay)
+# ===============================
+# XMRIG MEMORY REFRESH (36h)
+# ===============================
+
+local start now runtime
+
+start=$(state_get XMRIG_START)
+now=$(date +%s)
+
+: "${start:=0}"
+
+runtime=$(( now - start ))
+
+# 36h = 129600 sec
+if (( runtime > 129600 )); then
+
+echo "♻️ Refresh mémoire xmrig (36h)"
+
+kill -TERM "$xmrig_pid" 2>/dev/null
+sleep 5
+
+xmrig_pid=""
+
+state_set XMRIG_START "$now"
+
+continue
+
+fi
 
 # Sécurité anti-agressivité
 (( delay < 8 )) && delay=8
+
+delay=$(adaptive_loop_delay)
+
+# LOG ROTATION
+if [[ -f "$LOGFILE" ]]; then
+size=$(stat -c%s "$LOGFILE" 2>/dev/null)
+if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 6000000 )); then
+echo "🗜️ Rotation log xmrig"
+tail -n 400 "$LOGFILE" > "${LOGFILE}.tmp"
+mv -f "${LOGFILE}.tmp" "$LOGFILE"
+fi
+fi
 
 sleep "$delay"
     done
