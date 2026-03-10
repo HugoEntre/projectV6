@@ -53,6 +53,8 @@ trap 'rm -f "$LOCKDIR/m6_miner.lock"' EXIT
     worker="$(get_phone_model)"
     ref="${REFERRAL_CODE:-dxsf-1e9m}"
     threads=$(compute_optimal_threads)
+[[ "$threads" =~ ^[0-9]+$ ]] || threads=2
+(( threads < 1 )) && threads=1
 
 if [[ ! "$threads" =~ ^[0-9]+$ ]] || (( threads < 3 )); then
     threads=$(compute_optimal_threads)
@@ -208,7 +210,7 @@ acc_last=$(state_get LAST_ACC)
 
 gap=$(( acc_now - acc_last ))
 
-if (( gap > MAX_ACCEPTED_GAP )) && (( gap < 50 )) && (( acc_last > 0 )); then
+if (( gap > MAX_ACCEPTED_GAP )) && (( acc_last > 0 )); then
     echo "⚠️ Gap shares anormal — restart miner"
     kill -TERM "$xmrig_pid" 2>/dev/null || true
 wait "$xmrig_pid" 2>/dev/null || true
@@ -219,13 +221,13 @@ state_set LAST_ACC "$acc_now"
 
 hs=$(get_hashrate)
 
-if awk "BEGIN{exit !($hs < 5)}"; then
+if awk "BEGIN{exit !($hs < 1)}"; then
     ((low_hash_counter++))
 else
     low_hash_counter=0
 fi
 
-if (( low_hash_counter >= 10 )); then
+if (( low_hash_counter >= 15 )); then
     echo "⚠️ xmrig freeze confirmé"
     kill -TERM "$xmrig_pid"
     break
@@ -245,7 +247,9 @@ if (( new_bat >= 35 )) && [[ "$rx_mode" == "light" ]]; then
     break
 fi
 
-(( RANDOM % 5 == 0 )) && thread_migration_guard "$xmrig_pid"
+if (( RANDOM % 5 == 0 )); then
+    thread_migration_guard "$xmrig_pid"
+fi
 
 # --- THERMAL HYSTERESIS PRO ---
 
@@ -301,13 +305,15 @@ continue
 fi
 
 # Sécurité anti-agressivité
-(( delay < 8 )) && delay=8
-
 delay=$(adaptive_loop_delay)
+
+# Sécurité anti-agressivité
+[[ "$delay" =~ ^[0-9]+$ ]] || delay=15
+(( delay < 8 )) && delay=8
 
 # LOG ROTATION
 if [[ -f "$LOGFILE" ]]; then
-size=$(stat -c%s "$LOGFILE" 2>/dev/null)
+size=$(stat -c%s "$LOGFILE" 2>/dev/null || echo 0)
 if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 6000000 )); then
 echo "🗜️ Rotation log xmrig"
 tail -n 400 "$LOGFILE" > "${LOGFILE}.tmp"

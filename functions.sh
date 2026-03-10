@@ -162,32 +162,49 @@ detect_cpu_topology() {
 
     [[ "$CPU_TOPOLOGY_READY" == "1" ]] && return
 
-    local idx cap
+    local idx cap maxfreq
 
     for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
 
         idx=$(basename "$cpu" | tr -dc '0-9')
-        [[ -f "$cpu/cpu_capacity" ]] || continue
 
-        read -r cap < "$cpu/cpu_capacity" 2>/dev/null || continue
-        [[ "$cap" =~ ^[0-9]+$ ]] || continue
+        if [[ -f "$cpu/cpu_capacity" ]]; then
 
-        if (( cap < 600 )); then
-            CPU_LITTLE+="${idx},"
+            read -r cap < "$cpu/cpu_capacity" 2>/dev/null || continue
+            [[ "$cap" =~ ^[0-9]+$ ]] || continue
+
+            if (( cap < 600 )); then
+                CPU_LITTLE+="${idx},"
+            else
+                CPU_BIG+="${idx},"
+            fi
+
         else
-            CPU_BIG+="${idx},"
+
+            # fallback fréquence CPU
+            if [[ -f "$cpu/cpufreq/cpuinfo_max_freq" ]]; then
+
+                read -r maxfreq < "$cpu/cpufreq/cpuinfo_max_freq" 2>/dev/null
+
+                if [[ "$maxfreq" =~ ^[0-9]+$ ]] && (( maxfreq < 2000000 )); then
+                    CPU_LITTLE+="${idx},"
+                else
+                    CPU_BIG+="${idx},"
+                fi
+            fi
+
         fi
     done
 
     CPU_LITTLE="${CPU_LITTLE%,}"
-CPU_BIG="${CPU_BIG%,}"
+    CPU_BIG="${CPU_BIG%,}"
 
-# fallback universel si cpu_capacity absent
-if [[ -z "$CPU_BIG" ]]; then
-    CPU_BIG=$(seq -s, 0 $(( $(nproc)-1 )))
-fi
+    # fallback final si rien détecté
+    if [[ -z "$CPU_BIG" && -z "$CPU_LITTLE" ]]; then
+        CPU_BIG=$(seq -s, 0 $(( $(nproc)-1 )))
+    fi
 
-CPU_TOPOLOGY_READY=1
+    CPU_TOPOLOGY_READY=1
 }
 
 # ==================================================
@@ -420,7 +437,7 @@ get_hashrate() {
 
     local line hs
 
-    line=$(grep -a "speed" "$LOGFILE" | tail -n1)
+    line=$(tail -n 50 "$LOGFILE" | grep -a "speed" | tail -n1)
 
     [[ -z "$line" ]] && { echo 0; return; }
 
@@ -475,13 +492,23 @@ detect_cpu_topology
 local temp
 temp=$(get_cached_cpu_temp)
 
-# froid ou normal → tous les cores
+# froid ou normal → BIG d'abord
 if (( temp < 68 )); then
-echo "$CPU_LITTLE,$CPU_BIG"
-return
+    if [[ -n "$CPU_BIG" && -n "$CPU_LITTLE" ]]; then
+        echo "$CPU_BIG,$CPU_LITTLE"
+    else
+        echo "$CPU_BIG"
+    fi
+    return
 fi
 
-# chaud → LITTLE seulement
+# chaud → BIG seulement (plus efficace que LITTLE)
+if (( temp < 75 )); then
+    echo "$CPU_BIG"
+    return
+fi
+
+# très chaud → LITTLE seulement
 echo "$CPU_LITTLE"
 
 }
@@ -497,11 +524,11 @@ pin_xmrig_threads() {
     tids=$(ps -T -p "$pid" -o tid= 2>/dev/null)
 
     local i=0
-    for tid in $tids; do
 big_list=($(echo "$CPU_BIG" | tr ',' ' '))
 little_list=($(echo "$CPU_LITTLE" | tr ',' ' '))
 
 big_count=${#big_list[@]}
+for tid in $tids; do
 
 if (( i < big_count )); then
     taskset -pc "${big_list[$i]}" "$tid"
@@ -515,122 +542,101 @@ fi
 }
 
 measure_thread_load() {
+
     local pid="$1"
     local TMPDIR="${TMPDIR:-$PREFIX/tmp}"
     mkdir -p "$TMPDIR" 2>/dev/null || true
     local tmpfile="$TMPDIR/m6_thread_load.$$"
-    
+
     [[ -z "$pid" ]] && return 1
-    
-    # Vérifier que le processus existe
-    if ! kill -0 "$pid" 2>/dev/null; then
-        return 1
-    fi
-    
+    kill -0 "$pid" 2>/dev/null || return 1
+
     rm -f "$tmpfile" 2>/dev/null || true
-    
+
+    # Méthode 1 : ps
     if command -v ps >/dev/null 2>&1; then
-       ps -T -p "$pid" -o tid=,pcpu= 2>/dev/null | sort -k2 -rn > "$tmpfile" 2>/dev/null || true
+        ps -T -p "$pid" -o tid=,pcpu= 2>/dev/null \
+        | sort -k2 -rn > "$tmpfile" 2>/dev/null || true
     fi
-    
-    # Si le fichier est vide ou n'existe pas, méthode 2: /proc
-    if [[ ! -s "$tmpfile" ]]; then
-        if [[ -d "/proc/$pid/task" ]]; then
-            for tid_path in /proc/$pid/task/*; do
-                tid=$(basename "$tid_path")
-                if [[ -f "/proc/$pid/task/$tid/stat" ]]; then
-                    # Récupérer le temps CPU
-                    local utime stime total
-                    read -r _ _ _ _ _ _ _ _ _ _ _ _ _ utime stime _ < "/proc/$pid/task/$tid/stat" 2>/dev/null || continue
-                    total=$((utime + stime))
-                    printf '%s %s\n' "$tid" "$total" >> "$tmpfile" 2>/dev/null || :
-                fi
-            done
-            if [[ -s "$tmpfile" ]]; then
-                sort -k2 -rn "$tmpfile" -o "$tmpfile" 2>/dev/null || true
+
+    # Méthode 2 : /proc
+    if [[ ! -s "$tmpfile" && -d "/proc/$pid/task" ]]; then
+
+        for tid_path in /proc/$pid/task/*; do
+
+            local tid utime stime total
+
+            tid=$(basename "$tid_path")
+
+            if [[ -f "/proc/$pid/task/$tid/stat" ]]; then
+                read -r _ _ _ _ _ _ _ _ _ _ _ _ _ utime stime _ \
+                < "/proc/$pid/task/$tid/stat" 2>/dev/null || continue
+
+                total=$((utime + stime))
+                printf '%s %s\n' "$tid" "$total" >> "$tmpfile"
             fi
-        fi
+
+        done
+
+        [[ -s "$tmpfile" ]] && sort -k2 -rn "$tmpfile" -o "$tmpfile"
     fi
-    
-    # Si toujours pas de données, retourner 1
-    if [[ ! -s "$tmpfile" ]]; then
-        rm -f "$tmpfile" 2>/dev/null || true
-        return 1
-    fi
-    
+
+    [[ ! -s "$tmpfile" ]] && { rm -f "$tmpfile"; return 1; }
+
     echo "$tmpfile"
 }
 
 pin_xmrig_threads_smart() {
+
     detect_cpu_topology
-    local tmpfile sortedfile
-    [[ -z "$CPU_BIG" ]] && return
+
     local pid="$1"
     [[ -z "$pid" ]] && return
-    
-    # Vérifier que le processus existe
-    if ! kill -0 "$pid" 2>/dev/null; then
-        return
-    fi
+    kill -0 "$pid" 2>/dev/null || return
+
     [[ -z "$CPU_BIG" ]] && return
+
     local TMPDIR="${TMPDIR:-$PREFIX/tmp}"
     mkdir -p "$TMPDIR" 2>/dev/null || true
-    
-    # Mesurer la charge
+
+    local tmpfile sortedfile
     tmpfile=$(measure_thread_load "$pid")
-    
-    # Vérifier que le fichier a été créé
-    if [[ ! -f "$tmpfile" ]]; then
-        return
-    fi
-    
+    [[ ! -s "$tmpfile" ]] && return
+
     sortedfile="${tmpfile}.sorted"
-    
-    # Trier par charge (du plus chargé au moins chargé)
-    if [[ -s "$tmpfile" ]]; then
-        sort -k2 -rn "$tmpfile" > "$sortedfile" 2>/dev/null || true
-    else
-        rm -f "$tmpfile" 2>/dev/null || true
-        return
-    fi
-    
-    # Vérifier que le fichier trié existe
-    if [[ ! -f "$sortedfile" ]]; then
-        rm -f "$tmpfile" 2>/dev/null || true
-        return
-    fi
-    
-    local i=0
-    big_count=$(echo "$CPU_BIG" | tr ',' '\n' | wc -l)
+    sort -k2 -rn "$tmpfile" > "$sortedfile" 2>/dev/null || { rm -f "$tmpfile"; return; }
 
-while read -r tid pcpu; do
-
-# Nettoyer tid
-tid=${tid%% *}
-[[ -z "$tid" ]] && continue
-
-# vérifier que le thread existe encore
-    if [[ -d "/proc/$pid/task/$tid" ]]; then
+    local big_list little_list
+    local big_count little_count
 
     big_list=($(echo "$CPU_BIG" | tr ',' ' '))
-little_list=($(echo "$CPU_LITTLE" | tr ',' ' '))
+    little_list=($(echo "$CPU_LITTLE" | tr ',' ' '))
 
-big_count=${#big_list[@]}
+    big_count=${#big_list[@]}
+    little_count=${#little_list[@]}
 
-    if (( i < big_count )); then
-    taskset -pc "${big_list[$i]}" "$tid" >/dev/null 2>&1
-else
-    idx=$(( (i-big_count) % ${#little_list[@]} ))
-    taskset -pc "${little_list[$idx]}" "$tid" >/dev/null 2>&1
-    fi
-  fi
+    local i=0 tid pcpu idx
 
-((i++))
+    while read -r tid pcpu; do
 
-done < "$sortedfile" 2>/dev/null || true
-    
-    # Nettoyage
-    rm -f "$tmpfile" "$sortedfile" 2>/dev/null || true
+        tid=${tid%% *}
+        [[ -z "$tid" ]] && continue
+        [[ ! -d "/proc/$pid/task/$tid" ]] && continue
+
+        if (( i < big_count )); then
+            taskset -pc "${big_list[$i]}" "$tid" >/dev/null 2>&1
+        else
+            if (( little_count > 0 )); then
+                idx=$(( (i - big_count) % little_count ))
+                taskset -pc "${little_list[$idx]}" "$tid" >/dev/null 2>&1
+            fi
+        fi
+
+        ((i++))
+
+    done < "$sortedfile"
+
+    rm -f "$tmpfile" "$sortedfile" 2>/dev/null
 }
 
 thread_migration_guard() {
@@ -728,8 +734,9 @@ compute_optimal_threads() {
     little=$(echo "$CPU_LITTLE" | tr ',' '\n' | wc -l)
     big=$(echo "$CPU_BIG" | tr ',' '\n' | wc -l)
 
-    nominal=$(( little + big/2 ))
+    nominal=$(( big + 1 ))
 
+    (( nominal > total )) && nominal=$total
     (( nominal > limit )) && nominal=$limit
     (( nominal < 2 )) && nominal=2
 
@@ -742,16 +749,15 @@ thermal_pause_needed() {
     temp=$(get_cached_cpu_temp)
     bat=$(get_cached_battery_level)
 
-    # Détection état charge Android universel
     status=$(state_get BAT_STATUS)
 
-charging=0
-[[ "$status" == "CHARGING" || "$status" == "FULL" ]] && charging=1
+    charging=0
+    [[ "$status" == "CHARGING" || "$status" == "FULL" ]] && charging=1
 
-    # pause douce avant throttling
-    (( temp >= HOT_THRESHOLD+5 )) && return 0
+    # pause seulement à température critique
+    (( temp >= MAX_TEMP )) && return 0
 
-    # batterie basse seulement si NON branché
+    # batterie basse seulement si non branché
     if (( bat <= BATTERY_ECO )) && (( charging == 0 )); then
         return 0
     fi
@@ -834,7 +840,7 @@ power_curve_learn() {
 
     [[ "$thr" =~ ^[0-9]+$ ]] || return 0
     [[ "$hs" =~ ^[0-9.]+$ ]] || return 0
-awk "BEGIN{exit !($hs > 50)}" || return 0
+awk "BEGIN{exit !($hs > 5)}" || return 0
 
     key="POWER_${mode}_${thr}"
 
@@ -942,10 +948,16 @@ metrics_loop() {
 
         # Flush complet toutes les 2 minutes
         if (( now - last_flush >= 120 )); then
-            state_set HS "$(get_hashrate)"
-            state_set ACC "$(get_accepted)"
-            state_set BAT_LVL "$(get_battery)"
-            state_set THR "$(get_threads)"
+            local hs acc bat thr
+hs=$(get_hashrate)
+acc=$(get_accepted)
+bat=$(get_battery)
+thr=$(get_threads)
+
+[[ "$hs" != "$(state_get HS)" ]] && state_set HS "$hs"
+[[ "$acc" != "$(state_get ACC)" ]] && state_set ACC "$acc"
+[[ "$bat" != "$(state_get BAT_LVL)" ]] && state_set BAT_LVL "$bat"
+[[ "$thr" != "$(state_get THR)" ]] && state_set THR "$thr"
             last_flush=$now
         fi
 

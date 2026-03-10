@@ -113,6 +113,7 @@ wakelock_guard
 metrics_loop &
 METRICS_PID=$!
 MINER_PID=""
+disown
 
 # ==================================================
 # DASHBOARD UI
@@ -315,6 +316,7 @@ if [[ -z "$MINER_PID" ]] || ! kill -0 "$MINER_PID" 2>/dev/null; then
     sleep 2
 
 fi
+
 # --- MAINTENANCE 4H ---
 if (( NOW - ${LAST_MAINT:-0} >= 14400 )); then
     echo "🧹 Maintenance légère"
@@ -322,14 +324,14 @@ if (( NOW - ${LAST_MAINT:-0} >= 14400 )); then
     
     (
         flock -x 9
-        grep -Ev '^TMP_' "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+        grep -Ev '^(HS|ACC|CPU_TEMP|BAT_TEMP|BAT_LVL|BAT_STATUS|BAT_MODE|THERM_LAST|UI_LAST|TMP_)' \
+        "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
         mv -f "${STATE_FILE}.tmp" "$STATE_FILE"
     ) 9>"${STATE_FILE}.lock"
 
     LAST_MAINT=$NOW
 fi
 
-# --- RESET APPRENTISSAGE 14j ---
 # --- RESET APPRENTISSAGE ---
 if (( NOW - ${LAST_LEARN_RESET:-0} >= 1209600 )); then
     echo "🧠 Reset power curve"
@@ -355,7 +357,8 @@ fi
     fi
 
     # --- MAINTENANCE LOG ---
-    if [[ -f "$LOGFILE" ]] && (( $(stat -c%s "$LOGFILE") > 5000000 )); then
+    if [[ -f "$LOGFILE" ]] && size=$(stat -c%s "$LOGFILE" 2>/dev/null || echo 0)
+(( size > 5000000 )); then
         tail -n 500 "$LOGFILE" > "${LOGFILE}.tmp" && mv "${LOGFILE}.tmp" "$LOGFILE"
     fi
 

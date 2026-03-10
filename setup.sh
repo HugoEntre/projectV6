@@ -29,7 +29,7 @@ echo "📂 Normalisation projet..."
 mkdir -p "$TARGET_DIR"
 
 if [ "$SCRIPT_DIR" != "$TARGET_DIR" ]; then
-rsync -a --ignore-existing "$SCRIPT_DIR"/ "$TARGET_DIR"/ 2>/dev/null || true
+rsync -a --delete "$SCRIPT_DIR"/ "$TARGET_DIR"/ 2>/dev/null || true
 fi
 
 cd "$TARGET_DIR"
@@ -81,8 +81,12 @@ fi
 #--- COMMANDE GLOBALE M6 ---
 
 echo "⚙️ Configuration système..."
-sed -i '/# AUTO_MASTER_V6/d' ~/.bashrc
-echo "alias m6='cd $TARGET_DIR && ./start.sh' # AUTO_MASTER_V6" >> ~/.bashrc
+
+BASHRC="$HOME/.bashrc"
+[ -f "$BASHRC" ] || touch "$BASHRC"
+
+sed -i '/# AUTO_MASTER_V6/d' "$BASHRC"
+echo "alias m6='cd $TARGET_DIR && ./start.sh' # AUTO_MASTER_V6" >> "$BASHRC"
 
 printf "#!$PREFIX/bin/bash\ncd $TARGET_DIR && exec ./start.sh\n" > "$PREFIX/bin/m6"
 chmod +x "$PREFIX/bin/m6"
